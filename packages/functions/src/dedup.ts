@@ -114,21 +114,39 @@ function dedupAccessors(document: Document): void {
 		hashSet.add(accessor);
 	}
 
-	// Find duplicate accessors of a given type.
+	// Find duplicate accessors of a given type. Accessors are already grouped by structural
+	// properties (count, type, componentType, ...), but content may still differ. Hash the
+	// content into smaller buckets first, so expensive byte-by-byte comparisons happen only
+	// among accessors with matching hashes. Without this, large groups of same-sized accessors
+	// (e.g. hundreds of identical vertex buffers) require O(n²) full comparisons.
 	function detectDuplicates(accessors: Accessor[], duplicates: Map<Accessor, Accessor>): void {
-		for (let i = 0; i < accessors.length; i++) {
-			const a = accessors[i];
-			const aData = BufferUtils.toView(a.getArray()!);
+		if (accessors.length < 2) return;
 
-			if (duplicates.has(a)) continue;
+		const buckets = new Map<string, Accessor[]>();
+		for (const accessor of accessors) {
+			const hash = hashContent(BufferUtils.toView(accessor.getArray()!));
+			let bucket = buckets.get(hash);
+			if (!bucket) buckets.set(hash, (bucket = []));
+			bucket.push(accessor);
+		}
 
-			for (let j = i + 1; j < accessors.length; j++) {
-				const b = accessors[j];
+		for (const bucket of buckets.values()) {
+			if (bucket.length < 2) continue;
 
-				if (duplicates.has(b)) continue;
+			for (let i = 0; i < bucket.length; i++) {
+				const a = bucket[i];
 
-				if (BufferUtils.equals(aData, BufferUtils.toView(b.getArray()!))) {
-					duplicates.set(b, a);
+				if (duplicates.has(a)) continue;
+				const aData = BufferUtils.toView(a.getArray()!);
+
+				for (let j = i + 1; j < bucket.length; j++) {
+					const b = bucket[j];
+
+					if (duplicates.has(b)) continue;
+
+					if (BufferUtils.equals(aData, BufferUtils.toView(b.getArray()!))) {
+						duplicates.set(b, a);
+					}
 				}
 			}
 		}
@@ -339,6 +357,36 @@ function dedupSkins(document: Document, options: Required<DedupOptions>): void {
 		});
 		src.dispose();
 	});
+}
+
+/**
+ * Generates a 64-bit content hash for an accessor's data, used only to bucket candidate
+ * duplicates before byte comparison. Collisions are harmless — candidates within a bucket are
+ * still compared byte-for-byte — but equal data always produces equal hashes.
+ *
+ * Hashes 4 bytes at a time through a DataView, so results are independent of the alignment of
+ * the underlying ArrayBuffer. Returns two 32-bit words concatenated, reducing collision odds
+ * for larger buffers.
+ */
+function hashContent(view: Uint8Array): string {
+	const dataView = new DataView(view.buffer, view.byteOffset, view.byteLength);
+	const byteLength = view.byteLength;
+	const wordLength = byteLength >>> 2;
+
+	let h1 = 0x811c9dc5;
+	let h2 = 0x1b873593;
+	for (let i = 0; i < wordLength; i++) {
+		const word = dataView.getUint32(i << 2, true);
+		h1 = Math.imul(h1 ^ word, 0x01000193) >>> 0;
+		h2 = (Math.imul(h2 ^ word, 0x5bd1e995) ^ (h2 >>> 15)) >>> 0;
+	}
+	for (let i = wordLength << 2; i < byteLength; i++) {
+		const byte = view[i];
+		h1 = Math.imul(h1 ^ byte, 0x01000193) >>> 0;
+		h2 = (Math.imul(h2 ^ byte, 0x5bd1e995) ^ (h2 >>> 15)) >>> 0;
+	}
+
+	return `${byteLength}:${h1}:${h2}`;
 }
 
 /** Generates a key unique to the content of a primitive or target. */

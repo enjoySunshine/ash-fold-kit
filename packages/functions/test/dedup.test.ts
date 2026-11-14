@@ -215,6 +215,116 @@ describe('functions::dedup', () => {
 		deepEqual([matA, matB, matC].map(isDisposed), [false, true, false], 'materials - discard unique names');
 		deepEqual([meshA, meshB, meshC].map(isDisposed), [false, true, false], 'meshes - discard unique names');
 	});
+
+	test('accessors - large identical groups', () => {
+		const document = new Document();
+		const root = document.getRoot();
+
+		const COUNT_FLOATS = 18000;
+		const base = new Float32Array(COUNT_FLOATS);
+		for (let i = 0; i < COUNT_FLOATS; i++) base[i] = ((i * 17) % 97) * 0.01;
+
+		for (let i = 0; i < 90; i++) {
+			const array = base.slice();
+			if (i >= 12) array[0] = i;
+			const position = document.createAccessor().setType('VEC3').setArray(array);
+			const index = document
+				.createAccessor()
+				.setType('SCALAR')
+				.setArray(new Uint16Array([0, 1, 2]));
+			const prim = document.createPrimitive().setAttribute('POSITION', position).setIndices(index);
+			document.createMesh().addPrimitive(prim);
+			if (i === 0) prim.setAttribute('COLOR_0', position.clone().setNormalized(true));
+		}
+
+		const lastSeven = base.slice();
+		lastSeven[COUNT_FLOATS - 1] = 7;
+		document
+			.createMesh()
+			.addPrimitive(
+				document
+					.createPrimitive()
+					.setAttribute('POSITION', document.createAccessor().setType('VEC3').setArray(lastSeven)),
+			);
+
+		const at9000 = base.slice();
+		at9000[9000] = 3;
+		document
+			.createMesh()
+			.addPrimitive(
+				document
+					.createPrimitive()
+					.setAttribute('POSITION', document.createAccessor().setType('VEC3').setArray(at9000)),
+			);
+
+		const inputBase = new Float32Array([0, 1]);
+		const outputBase = base.slice(0, 3000);
+		for (let i = 0; i < 17; i++) {
+			const output = outputBase.slice();
+			if (i >= 5 && i <= 15) output[0] = i;
+			if (i === 16) output[2999] = 9;
+			document
+				.createAnimation()
+				.addSampler(
+					document
+						.createAnimationSampler()
+						.setInput(document.createAccessor().setType('SCALAR').setArray(inputBase.slice()))
+						.setOutput(document.createAccessor().setType('SCALAR').setArray(output)),
+				);
+		}
+
+		strictEqual(root.listAccessors().length, 217, 'begins with duplicate accessors');
+
+		const t0 = performance.now();
+		dedup()(document);
+		const t1 = performance.now();
+
+		strictEqual(root.listAccessors().length, 97, 'prunes duplicate accessors');
+		ok(t1 - t0 < 2000, 'dedup of large identical groups is not quadratic');
+
+		// 82 = 90 shells (merged: index 0..11 to one, 12..89 unique) + 2 variants.
+		const prims = root.listMeshes().flatMap((mesh) => mesh.listPrimitives());
+		strictEqual(root.listMeshes().length, 82, 'merges identical meshes');
+		strictEqual(prims[0].getAttribute('POSITION').getArray()![0], 0, 'merged shells keep first float 0');
+		deepEqual(Array.from(prims[0].getIndices()!.getArray()!), [0, 1, 2], 'indices preserved');
+
+		const positions = root.listAccessors().filter((accessor) => accessor.getType() === 'VEC3');
+		strictEqual(positions.length, 82, 'unique POSITION accessors');
+		strictEqual(
+			positions.some((accessor) => accessor.getArray()![0] === 12),
+			true,
+			'unique shell 12 survives',
+		);
+		strictEqual(
+			positions.some((accessor) => accessor.getArray()![17999] === 7),
+			true,
+			'last float 7 survives',
+		);
+		strictEqual(
+			positions.some((accessor) => accessor.getArray()![9000] === 3),
+			true,
+			'float 9000 = 3 survives',
+		);
+
+		const color = prims.find((prim) => prim.getAttribute('COLOR_0'))!.getAttribute('COLOR_0')!;
+		strictEqual(color.getNormalized(), true, 'normalized COLOR_0 is not merged into POSITION');
+
+		const samplers = root.listAnimations().flatMap((animation) => animation.listSamplers());
+		strictEqual(new Set(samplers.map((sampler) => sampler.getInput())).size, 1, 'merges sampler inputs');
+		strictEqual(new Set(samplers.map((sampler) => sampler.getOutput())).size, 13, 'merges sampler outputs');
+		const outputs = Array.from(new Set(samplers.map((sampler) => sampler.getOutput())));
+		strictEqual(outputs[0].getArray()![0], 0, 'merged outputs keep first float 0');
+		strictEqual(
+			outputs.some((output) => output.getArray()![0] === 5),
+			true,
+			'unique output 5 survives',
+		);
+		strictEqual(
+			outputs.some((output) => output.getArray()![2999] === 9),
+			true,
+			'trailing 9 survives',
+		);
+	});
 });
 
 const isDisposed = (prop: Property) => prop.isDisposed();
